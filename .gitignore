@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/Sign-Language-Digits-Dataset/Dataset/
+*.npz

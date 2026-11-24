@@ -1,0 +1,1 @@
+window.SIGNVISION_API_ORIGIN = "";

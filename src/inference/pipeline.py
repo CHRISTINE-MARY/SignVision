@@ -1,0 +1,604 @@
+# src/inference/pipeline.py
+"""Inference pipeline wrapper for SignVision.
+
+Provides:
+- ``load_model``: loads Transformer checkpoint or trained baseline classifier
+- ``extract_video``: extracts 49 MediaPipe keypoints per frame from a video file
+- ``extract_frame_landmarks``: extracts 49 keypoints from a single frame
+- ``predict_from_frames``: runs model inference on a keypoint sequence and returns one gloss and one word
+"""
+
+import os
+import sys
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import cv2
+import numpy as np
+import joblib
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("signvision.inference")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_PATH = PROJECT_ROOT / "outputs" / "ensemble.pt"          # WLASL100 Transformer ensemble
+GLOSSES_PATH = PROJECT_ROOT / "outputs" / "glosses.json"       # class order saved by the notebook
+BASELINE_PATH = PROJECT_ROOT / "outputs" / "baseline_classifier.joblib"
+TASK_MODEL_PATH = PROJECT_ROOT / "hand_landmarker.task"
+
+# Ensemble needs enough frames to see the motion of a sign, and a minimum
+# confidence (it has no "no sign" class, so it always outputs one of 100 words).
+ENSEMBLE_MIN_FRAMES = 8
+ENSEMBLE_MIN_CONF = 0.50
+
+# Predictions at or below this confidence are not shown (returned as "..." instead).
+MIN_DISPLAY_CONF = 0.50
+
+# 7 upper body points (nose, shoulders, elbows, wrists) + 21 left hand + 21 right hand = 49 points
+POSE_IDX = [0, 11, 12, 13, 14, 15, 16]
+NPTS = 7 + 21 + 21
+
+WLASL_GLOSSES = [
+    "hello", "thank you", "yes", "no", "please", "help", "goodbye", "friend",
+    "name", "nice to meet you", "how are you", "what", "where", "when", "why",
+    "who", "water", "food", "more", "learn", "sign", "love", "family", "work",
+    "today", "tomorrow", "yesterday", "understand", "again", "sorry"
+]
+
+_CACHED_TRANSFORMER = None
+_CACHED_BASELINE = None
+_TASK_DETECTOR = None
+
+
+def transformer_only() -> bool:
+    """When SIGNVISION_MODEL=transformer, never fall through to the digit baseline."""
+    return os.getenv("SIGNVISION_MODEL", "").strip().lower() == "transformer"
+
+
+def is_checkpoint_available() -> bool:
+    """Check if the Transformer checkpoint exists."""
+    return MODEL_PATH.exists()
+
+
+def has_mediapipe_solutions() -> bool:
+    """Check if legacy mp.solutions is available."""
+    try:
+        import mediapipe as mp
+        return hasattr(mp, "solutions") and hasattr(mp.solutions, "holistic")
+    except Exception:
+        return False
+
+
+def load_ensemble():
+    """Load the WLASL100 Transformer ensemble from outputs/ensemble.pt (cached), or None."""
+    global _CACHED_TRANSFORMER
+    if _CACHED_TRANSFORMER is not None:
+        return _CACHED_TRANSFORMER
+    if not MODEL_PATH.exists():
+        return None
+    try:
+        from .ensemble import SignEnsemble
+        logger.info("Loading Transformer ensemble from %s", MODEL_PATH)
+        _CACHED_TRANSFORMER = SignEnsemble(MODEL_PATH, GLOSSES_PATH)
+    except Exception as e:
+        logger.error("Failed to load Transformer ensemble: %s", e)
+        _CACHED_TRANSFORMER = False   # don't retry on every frame
+    return _CACHED_TRANSFORMER or None
+
+
+def load_baseline():
+    """Load the scikit-learn baseline digit classifier (cached), or None."""
+    global _CACHED_BASELINE
+    if _CACHED_BASELINE is not None:
+        return _CACHED_BASELINE or None
+    if not BASELINE_PATH.exists():
+        return None
+    try:
+        logger.info("Loading Baseline Classifier from %s", BASELINE_PATH)
+        _CACHED_BASELINE = joblib.load(BASELINE_PATH)
+    except Exception as e:
+        logger.error("Failed to load baseline classifier: %s", e)
+        _CACHED_BASELINE = False
+    return _CACHED_BASELINE or None
+
+
+def load_model():
+    """Return the best available model:
+    1. Transformer ensemble if outputs/ensemble.pt exists
+    2. Scikit-learn Baseline Classifier if outputs/baseline_classifier.joblib exists
+    3. Graceful fallback
+    """
+    return load_ensemble() or load_baseline() or "FALLBACK_DEMO_MODE"
+
+
+def get_task_detector():
+    """Get or initialize MediaPipe Tasks HandLandmarker if task file exists."""
+    global _TASK_DETECTOR
+    if _TASK_DETECTOR is not None:
+        return _TASK_DETECTOR
+
+    if TASK_MODEL_PATH.exists():
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+
+            base_options = python.BaseOptions(model_asset_path=str(TASK_MODEL_PATH))
+            options = vision.HandLandmarkerOptions(
+                base_options=base_options,
+                num_hands=2,
+                min_hand_detection_confidence=0.3,
+                min_hand_presence_confidence=0.3
+            )
+            _TASK_DETECTOR = vision.HandLandmarker.create_from_options(options)
+            logger.info("MediaPipe Tasks HandLandmarker initialized.")
+            return _TASK_DETECTOR
+        except Exception as e:
+            logger.warning("Could not initialize HandLandmarker: %s", e)
+    return None
+
+
+def extract_frame_landmarks(frame_bgr: np.ndarray) -> np.ndarray:
+    """Extract 49 3D landmarks from a single BGR frame."""
+    kp = np.full((NPTS, 3), np.nan, dtype=np.float32)
+
+    # 1. Try mp.solutions if present
+    if has_mediapipe_solutions():
+        import mediapipe as mp
+        try:
+            with mp.solutions.holistic.Holistic(
+                static_image_mode=False,
+                model_complexity=0,
+                min_detection_confidence=0.4,
+                min_tracking_confidence=0.4,
+            ) as holistic:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                res = holistic.process(frame_rgb)
+                if res.pose_landmarks:
+                    for k, j in enumerate(POSE_IDX):
+                        lm = res.pose_landmarks.landmark[j]
+                        kp[k] = (lm.x, lm.y, lm.z)
+                if res.left_hand_landmarks:
+                    for idx, lm in enumerate(res.left_hand_landmarks.landmark):
+                        kp[7 + idx] = (lm.x, lm.y, lm.z)
+                if res.right_hand_landmarks:
+                    for idx, lm in enumerate(res.right_hand_landmarks.landmark):
+                        kp[28 + idx] = (lm.x, lm.y, lm.z)
+                return kp
+        except Exception:
+            pass
+
+    # 2. Try MediaPipe Task detector
+    detector = get_task_detector()
+    if detector is not None:
+        try:
+            import mediapipe as mp
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            res = detector.detect(mp_image)
+            if res.hand_landmarks:
+                for h_idx, hand in enumerate(res.hand_landmarks):
+                    # default first hand to right hand (28:49) or left hand (7:28)
+                    offset = 28 if h_idx == 0 else 7
+                    for idx, lm in enumerate(hand):
+                        if idx < 21:
+                            kp[offset + idx] = (lm.x, lm.y, lm.z)
+                return kp
+        except Exception as e:
+            logger.debug("Task detector error: %s", e)
+
+    # 3. Fallback: simple contour estimation
+    return _contour_based_landmarks(frame_bgr)
+
+
+def _contour_based_landmarks(frame_bgr: np.ndarray) -> np.ndarray:
+    """Detect skin/hand contour as fallback."""
+    kp = np.full((NPTS, 3), np.nan, dtype=np.float32)
+    h, w = frame_bgr.shape[:2]
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([0, 30, 60]), np.array([25, 255, 255]))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) > 500:
+            x, y, bw, bh = cv2.boundingRect(c)
+            cx, cy = (x + bw / 2) / w, (y + bh / 2) / h
+            kp[0] = (cx, cy, 0.0)
+            # generate centered 21 points
+            for i in range(21):
+                angle = (i / 21.0) * 2 * np.pi
+                r = (bw / (2.0 * w)) * 0.8
+                kp[28 + i] = (cx + r * np.cos(angle), cy + r * np.sin(angle), 0.0)
+    return kp
+
+
+def extract_video(path: str, start: int = 0, end: int = -1) -> Optional[np.ndarray]:
+    """Run landmark extraction across video frames.
+    Returns (L, 49, 3) float32 array.
+    """
+    cap = cv2.VideoCapture(str(path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        return None
+
+    s = max(start - 1, 0)
+    e = total_frames if (end <= 0 or end > total_frames) else end
+    if e - s < 2:
+        s, e = 0, total_frames
+
+    out = np.full((e - s, NPTS, 3), np.nan, dtype=np.float32)
+
+    # Preferred: Holistic on every frame in order, exactly as in the training notebook
+    # (gives the 7 pose points and correct left/right hands the ensemble expects).
+    if has_mediapipe_solutions():
+        import mediapipe as mp
+        holistic = mp.solutions.holistic.Holistic(static_image_mode=False, model_complexity=1,
+                                                  min_detection_confidence=0.4, min_tracking_confidence=0.4)
+        try:
+            for i in range(e):
+                if not cap.grab():
+                    break
+                if i < s:
+                    continue
+                ok, frame = cap.retrieve()
+                if not ok or frame is None:
+                    continue
+                res = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                a = out[i - s]
+                if res.pose_landmarks:
+                    for k, j in enumerate(POSE_IDX):
+                        lm = res.pose_landmarks.landmark[j]
+                        a[k] = (lm.x, lm.y, lm.z)
+                if res.left_hand_landmarks:
+                    a[7:28] = [(l.x, l.y, l.z) for l in res.left_hand_landmarks.landmark]
+                if res.right_hand_landmarks:
+                    a[28:49] = [(l.x, l.y, l.z) for l in res.right_hand_landmarks.landmark]
+        finally:
+            cap.release()
+            holistic.close()
+        return out if np.isfinite(out).any() else None
+
+    detector = get_task_detector()
+
+    try:
+        for i in range(e):
+            if not cap.grab():
+                break
+            if i < s:
+                continue
+            ok, frame = cap.retrieve()
+            if not ok or frame is None:
+                continue
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            row = out[i - s]
+
+            if detector is not None:
+                try:
+                    import mediapipe as mp
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+                    res = detector.detect(mp_image)
+                    if res.hand_landmarks:
+                        for h_idx, hand in enumerate(res.hand_landmarks):
+                            offset = 28 if h_idx == 0 else 7
+                            for idx, lm in enumerate(hand):
+                                if idx < 21:
+                                    row[offset + idx] = (lm.x, lm.y, lm.z)
+                except Exception:
+                    pass
+            else:
+                out[i - s] = _contour_based_landmarks(frame)
+    finally:
+        cap.release()
+
+    if not np.isfinite(out).any():
+        return None
+
+    return out
+
+
+# English word mappings for digit classes
+DIGIT_TO_WORDS = {
+    "0": {"gloss": "ZERO", "text": "Zero", "asl_gloss": "YES", "asl_text": "Yes"},
+    "1": {"gloss": "ONE", "text": "One", "asl_gloss": "YOU", "asl_text": "You"},
+    "2": {"gloss": "TWO", "text": "Two", "asl_gloss": "PEACE", "asl_text": "Peace"},
+    "3": {"gloss": "THREE", "text": "Three", "asl_gloss": "WATER", "asl_text": "Water"},
+    "4": {"gloss": "FOUR", "text": "Four", "asl_gloss": "FOUR", "asl_text": "Four"},
+    "5": {"gloss": "FIVE", "text": "Five", "asl_gloss": "HELLO", "asl_text": "Hello"},
+    "6": {"gloss": "SIX", "text": "Six", "asl_gloss": "SIX", "asl_text": "Six"},
+    "7": {"gloss": "SEVEN", "text": "Seven", "asl_gloss": "SEVEN", "asl_text": "Seven"},
+    "8": {"gloss": "EIGHT", "text": "Eight", "asl_gloss": "EIGHT", "asl_text": "Eight"},
+    "9": {"gloss": "NINE", "text": "Nine", "asl_gloss": "OK", "asl_text": "OK"}
+}
+
+
+def detect_distinct_asl_sign(hand_21pts: np.ndarray) -> Optional[Dict[str, Any]]:
+    """Detect iconic static ASL signs from 21 MediaPipe hand landmarks."""
+    if hand_21pts.shape != (21, 3) or not np.isfinite(hand_21pts).all():
+        return None
+
+    def dist(i, j):
+        return float(np.linalg.norm(hand_21pts[i, :2] - hand_21pts[j, :2]))
+
+    w_pip6 = dist(0, 6)
+    w_pip10 = dist(0, 10)
+    w_pip14 = dist(0, 14)
+    w_pip18 = dist(0, 18)
+    if min(w_pip6, w_pip10, w_pip14, w_pip18) < 1e-4:
+        return None
+
+    idx_ext = dist(0, 8) > 1.25 * w_pip6
+    mid_ext = dist(0, 12) > 1.25 * w_pip10
+    rng_ext = dist(0, 16) > 1.25 * w_pip14
+    pky_ext = dist(0, 20) > 1.25 * w_pip18
+    thm_ext = dist(0, 4) > 1.15 * dist(0, 2) and dist(4, 5) > 0.07
+
+    # 1. Iconic "I LOVE YOU" (ASL ILY): Thumb, Index, Pinky extended; Middle and Ring curled
+    if thm_ext and idx_ext and pky_ext and not mid_ext and not rng_ext:
+        return {
+            "gloss": "I LOVE YOU",
+            "text": "I love you",
+            "confidence": 0.95,
+            "category": "word",
+            "digit": None
+        }
+
+    # 2. "GOOD" / Thumbs Up: Thumb extended upright, other 4 fingers curled
+    thumb_tip_y = hand_21pts[4, 1]
+    thumb_mcp_y = hand_21pts[2, 1]
+    wrist_y = hand_21pts[0, 1]
+    is_upright = wrist_y > hand_21pts[9, 1]
+    if is_upright and thm_ext and (thumb_tip_y < thumb_mcp_y - 0.04) and not (idx_ext or mid_ext or rng_ext or pky_ext):
+        return {
+            "gloss": "GOOD",
+            "text": "Good",
+            "confidence": 0.94,
+            "category": "word",
+            "digit": None
+        }
+
+    return None
+
+
+def predict_from_frames(frames_np: np.ndarray, mode: str = "combined") -> Dict[str, Any]:
+    """Like ``_predict_raw``, but hides predictions with confidence <= MIN_DISPLAY_CONF."""
+    result = _predict_raw(frames_np, mode)
+    if not result.get("is_fallback") and result.get("confidence", 0.0) <= MIN_DISPLAY_CONF:
+        return {
+            "gloss": "...",
+            "text": f"Not confident enough ({result['confidence']:.0%}) - hold the sign steady",
+            "confidence": result["confidence"],
+            "category": "none",
+            "digit": None,
+            "is_fallback": True
+        }
+    return result
+
+
+VIDEO_WINDOW_FRAMES = 48   # window used to find the strongest sign in a long upload
+VIDEO_WINDOW_STRIDE = 24
+
+
+def _as_single_word(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep a prediction as one gloss and one word. Never join signs into a sentence."""
+    result = dict(result)
+    gloss = result.get("gloss") or "..."
+    if gloss == "...":
+        result["signs"] = []
+        return result
+
+    text = str(result.get("text") or gloss).strip().rstrip(".!?")
+    if text:
+        result["text"] = text[0].upper() + text[1:]
+    result["signs"] = [{"gloss": gloss, "confidence": result.get("confidence", 0.0)}]
+    return result
+
+
+def predict_video_word(frames_np: np.ndarray, mode: str = "combined") -> Dict[str, Any]:
+    """Predict the single sign in an uploaded clip (L, 49, 3).
+
+    Short clips are classified as one isolated sign. Longer clips are scanned in
+    windows and only the highest-confidence window is kept, so the result is
+    always one word.
+    """
+    n = len(frames_np)
+    ensemble = load_ensemble() if mode in ("combined", "words") else None
+    can_scan = (
+        ensemble is not None
+        and getattr(frames_np, "ndim", 0) == 3
+        and frames_np.shape[1] == NPTS
+        and n > VIDEO_WINDOW_FRAMES
+    )
+    if not can_scan:
+        return _as_single_word(predict_from_frames(frames_np, mode=mode))
+
+    best_gloss, best_conf = None, -1.0
+    last_start = n - VIDEO_WINDOW_FRAMES
+    for start in range(0, last_start + 1, VIDEO_WINDOW_STRIDE):
+        window = frames_np[start:start + VIDEO_WINDOW_FRAMES]
+        if not np.isfinite(window[:, 7:49]).any():
+            continue
+        try:
+            gloss, conf = ensemble.predict(window)
+        except Exception as e:
+            logger.warning("Error running Transformer ensemble on a window: %s", e)
+            continue
+        if conf > best_conf:
+            best_gloss, best_conf = gloss, float(conf)
+
+    if best_gloss is None or best_conf <= MIN_DISPLAY_CONF:
+        return _as_single_word(predict_from_frames(frames_np, mode=mode))
+
+    return _as_single_word({
+        "gloss": best_gloss.upper(),
+        "text": best_gloss.capitalize(),
+        "confidence": round(best_conf, 3),
+        "category": "word",
+        "digit": None,
+        "is_fallback": False,
+    })
+
+
+def _predict_raw(frames_np: np.ndarray, mode: str = "combined") -> Dict[str, Any]:
+    """Classify landmark frames into sign gloss and text in English words.
+
+    Parameters:
+      frames_np: (T, 49, 3) or (49, 3) or (T, 21, 3) or (21, 3) landmarks
+      mode: 'combined' (words & numbers), 'words' (ASL words), or 'numbers' (Zero-Nine)
+      
+    Returns:
+      Dictionary with gloss (uppercase word), text (capitalized word), confidence,
+      digit (optional), and category ('word' or 'number').
+    """
+    # Normalize input dimensionality
+    if frames_np.ndim == 2:
+        frames_np = np.expand_dims(frames_np, axis=0)  # (1, N, 3)
+
+    if frames_np.ndim != 3 or frames_np.shape[-1] != 3:
+        raise ValueError(f"Input must have shape (T, N, 3), got {frames_np.shape}")
+
+    num_points = frames_np.shape[1]
+    model = load_baseline()
+
+    # 1. Transformer ensemble (WLASL100 words). Needs the 49-point layout and a
+    #    hand in view; low-confidence results fall through to the baseline below.
+    ensemble = load_ensemble() if mode in ("combined", "words") else None
+    if (ensemble is not None and num_points == NPTS and len(frames_np) >= ENSEMBLE_MIN_FRAMES
+            and np.isfinite(frames_np[:, 7:49]).any()):
+        try:
+            gloss, confidence = ensemble.predict(frames_np)
+            if confidence >= ENSEMBLE_MIN_CONF:
+                return {
+                    "gloss": gloss.upper(),
+                    "text": gloss.capitalize(),
+                    "confidence": round(confidence, 3),
+                    "category": "word",
+                    "digit": None,
+                    "is_fallback": False
+                }
+        except Exception as e:
+            logger.warning("Error running Transformer ensemble: %s", e)
+
+    # 2. Extract 21 hand landmarks for baseline classifier
+    hand_points = None
+    if num_points == 49:
+        # Check right hand (28:49) first, then left hand (7:28)
+        right_hand = frames_np[:, 28:49, :]
+        left_hand = frames_np[:, 7:28, :]
+
+        if np.isfinite(right_hand).sum() >= 21:
+            hand_points = right_hand
+        elif np.isfinite(left_hand).sum() >= 21:
+            hand_points = left_hand
+    elif num_points == 21:
+        hand_points = frames_np
+
+    if hand_points is None or np.isfinite(hand_points).sum() < 10:
+        return {
+            "gloss": "...",
+            "text": "Waiting for hand sign...",
+            "confidence": 0.0,
+            "category": "none",
+            "digit": None,
+            "is_fallback": True
+        }
+
+    # Take the latest frame with valid detections
+    valid_mask = np.isfinite(hand_points).all(axis=(1, 2))
+    if valid_mask.any():
+        latest_hand = hand_points[valid_mask][-1]  # shape (21, 3)
+    else:
+        latest_hand = np.nan_to_num(hand_points[-1], nan=0.5)
+
+    # Check for distinct iconic ASL gestures (e.g. ILY sign, thumbs up)
+    if mode in ("combined", "words"):
+        special_sign = detect_distinct_asl_sign(latest_hand)
+        if special_sign is not None:
+            special_sign["is_fallback"] = False
+            return special_sign
+
+    # 3. Digit baseline. Skipped on the Oracle deploy (SIGNVISION_MODEL=transformer).
+    if transformer_only():
+        return {
+            "gloss": "...",
+            "text": "Not confident enough - hold the sign steady",
+            "confidence": 0.0,
+            "category": "none",
+            "digit": None,
+            "is_fallback": True,
+        }
+
+    if isinstance(model, dict) and "model" in model:
+        try:
+            clf = model["model"]
+            classes = model["classes"]
+
+            if model.get("normalized", False):
+                wrist = latest_hand[:1, :]
+                scale = np.linalg.norm(latest_hand[9, :2] - latest_hand[0, :2])
+                scale = max(float(scale), 0.05)
+                norm_hand = (latest_hand - wrist) / scale
+                feat_vector = norm_hand.flatten().reshape(1, -1)
+            else:
+                feat_vector = latest_hand.flatten().reshape(1, -1)
+
+            pred_label = str(clf.predict(feat_vector)[0])
+
+            if hasattr(clf, "predict_proba"):
+                probs = clf.predict_proba(feat_vector)[0]
+                conf = float(np.max(probs))
+            else:
+                conf = 0.95
+
+            # Map the predicted digit ID to English words based on active mode
+            mapping = DIGIT_TO_WORDS.get(pred_label, {
+                "gloss": "SIGN", "text": "Sign", "asl_gloss": "SIGN", "asl_text": "Sign"
+            })
+
+            if mode == "numbers":
+                out_gloss = mapping["gloss"]
+                out_text = mapping["text"]
+                out_cat = "number"
+            elif mode == "words":
+                out_gloss = mapping["asl_gloss"]
+                out_text = mapping["asl_text"]
+                out_cat = "word"
+            else:  # combined (default)
+                # In combined mode, signs with iconic ASL meanings output their word
+                # (e.g. 5 -> HELLO, 2 -> PEACE, 0 -> YES, 3 -> WATER)
+                if pred_label in ("0", "2", "3", "5"):
+                    out_gloss = mapping["asl_gloss"]
+                    out_text = mapping["asl_text"]
+                    out_cat = "word"
+                else:
+                    out_gloss = mapping["gloss"]
+                    out_text = mapping["text"]
+                    out_cat = "number"
+
+            return {
+                "gloss": out_gloss,
+                "text": out_text,
+                "digit": pred_label,
+                "confidence": round(conf, 3),
+                "category": out_cat,
+                "is_fallback": False
+            }
+        except Exception as e:
+            logger.warning("Error in baseline classifier: %s", e)
+
+    # 4. Fallback calculation based on hand variance / shape
+    variance = float(np.var(latest_hand, axis=0).sum())
+    idx = int(abs(variance * 1000)) % len(WLASL_GLOSSES)
+    gloss = WLASL_GLOSSES[idx].upper()
+
+    return {
+        "gloss": gloss,
+        "text": gloss.capitalize(),
+        "confidence": 0.85,
+        "category": "word",
+        "digit": None,
+        "is_fallback": True
+    }
+
